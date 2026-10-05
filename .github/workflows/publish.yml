@@ -1,0 +1,94 @@
+# Publishes @alguna/sdk to npm when a merge to main changes the version in
+# package.json: it stages the version, then tags the commit v<version>. A version
+# that already has its tag is skipped, so other merges publish nothing.
+# npm trusted publishing (OIDC) binds the package to this repo and this file:
+# no npm token is stored. The version stays staged on npmjs.com until a
+# maintainer approves it with 2FA.
+name: Publish
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run at a time, so two merges cannot publish the same version twice.
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  version:
+    # Releases come from main only, also when the workflow is started by hand.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.version.outputs.publish }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Read the version and look for its tag
+        id: version
+        run: |
+          version=$(jq -r .version package.json)
+          echo "version=${version}" >>"$GITHUB_OUTPUT"
+          # --exit-code: 0 when the tag exists, 2 when it does not, other codes on errors.
+          if git ls-remote --exit-code --tags origin "refs/tags/v${version}" >/dev/null; then
+            echo "v${version} is already tagged, so it is already published. Nothing to do."
+            echo "publish=false" >>"$GITHUB_OUTPUT"
+          else
+            status=$?
+            if [ "${status}" != 2 ]; then exit "${status}"; fi
+            echo "publish=true" >>"$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: version
+    if: needs.version.outputs.publish == 'true'
+    # npm trusted publishing accepts GitHub-hosted runners only.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # `npm stage publish` needs npm 11.15 or later.
+      - name: Install npm
+        run: npm install --global npm@11.21.0
+
+      - name: Build
+        run: |
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run type-check
+          npm run build
+
+      - name: Stage on npm
+        run: npm stage publish --access public
+
+  # Tags the released commit last: the tag records that the version is published.
+  # The workflow token pushes it, so it does not start another workflow run.
+  # If only this job fails, use "Re-run failed jobs": a full re-run finds no tag
+  # and uploads the version again, which the registry refuses.
+  tag:
+    needs: [version, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Push the tag
+        env:
+          VERSION: ${{ needs.version.outputs.version }}
+        run: |
+          git tag "v${VERSION}" "${GITHUB_SHA}"
+          git push origin "refs/tags/v${VERSION}"
